@@ -1,0 +1,79 @@
+{
+  "metadata": {
+    "generatedAt": "2026-06-14T15:05:52.072Z",
+    "toolName": "api-regression",
+    "version": "1.0.0"
+  },
+  "summary": {
+    "totalSuites": 1,
+    "passedSuites": 0,
+    "failedSuites": 1,
+    "totalTests": 2,
+    "passedTests": 0,
+    "failedTests": 2,
+    "skippedTests": 0,
+    "totalAssertions": 2,
+    "passedAssertions": 0,
+    "failedAssertions": 2,
+    "durationMs": 26,
+    "startTime": "2026-06-14T15:05:52.045Z",
+    "endTime": "2026-06-14T15:05:52.071Z"
+  },
+  "suites": [
+    {
+      "id": "health-check",
+      "name": "服务健康检查",
+      "durationMs": 19,
+      "summary": {
+        "total": 2,
+        "passed": 0,
+        "failed": 2,
+        "skipped": 0
+      },
+      "tests": [
+        {
+          "id": "info-endpoint",
+          "name": "服务信息接口",
+          "status": "failed",
+          "durationMs": 16,
+          "error": "HttpRequestError: 网络连接失败 [ECONNREFUSED]: request to http://localhost:3000/info failed, reason: \n    at HttpClient.send (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/httpClient.js:80:19)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async TestRunner.runTestCase (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/runner.js:365:47)\n    at async Promise.all (index 0)\n    at async TestRunner.runSuite (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/runner.js:107:33)\n    at async TestRunner.run (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/runner.js:27:33)\n    at async executeRun (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/cli.js:198:21)\n    at async Command.<anonymous> (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/cli.js:56:13)\n    at async Command.parseAsync (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/node_modules/commander/lib/command.js:936:5)\n    at async main (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/cli.js:125:5)",
+          "retryAttempts": 1,
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:3000/info"
+          },
+          "response": null,
+          "assertions": [
+            {
+              "type": "request",
+              "severity": "critical",
+              "passed": false,
+              "message": "网络连接失败 [ECONNREFUSED]: request to http://localhost:3000/info failed, reason: "
+            }
+          ]
+        },
+        {
+          "id": "health-endpoint",
+          "name": "健康检查接口",
+          "status": "failed",
+          "durationMs": 6,
+          "error": "HttpRequestError: 网络连接失败 [ECONNREFUSED]: request to http://localhost:3000/health failed, reason: \n    at HttpClient.send (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/httpClient.js:80:19)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\n    at async TestRunner.runTestCase (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/runner.js:365:47)\n    at async Promise.all (index 1)\n    at async TestRunner.runSuite (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/runner.js:107:33)\n    at async TestRunner.run (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/core/runner.js:27:33)\n    at async executeRun (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/cli.js:198:21)\n    at async Command.<anonymous> (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/cli.js:56:13)\n    at async Command.parseAsync (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/node_modules/commander/lib/command.js:936:5)\n    at async main (/Users/jiayun/program/seed/require/task0610/task29-api-regression/api-regression/dist/cli.js:125:5)",
+          "retryAttempts": 1,
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:3000/health"
+          },
+          "response": null,
+          "assertions": [
+            {
+              "type": "request",
+              "severity": "critical",
+              "passed": false,
+              "message": "网络连接失败 [ECONNREFUSED]: request to http://localhost:3000/health failed, reason: "
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

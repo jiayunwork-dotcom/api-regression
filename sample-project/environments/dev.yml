@@ -1,0 +1,8 @@
+# 开发环境配置
+name: development
+baseUrl: http://localhost:3000
+variables:
+  token: "dev-token-placeholder"
+  defaultUserId: 1
+headers:
+  X-App-Version: "1.0.0"

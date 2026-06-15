@@ -1,0 +1,38 @@
+# 健康检查测试套件
+id: health-check
+name: 服务健康检查
+description: 基础连通性和健康检查接口测试
+baseUrl: ${env:base_url}
+
+tests:
+  - id: health-endpoint
+    name: 健康检查接口
+    tags: ["smoke", "health", "critical"]
+    request:
+      method: GET
+      url: /health
+    assertions:
+      - statusCode: 200
+        severity: critical
+      - responseTime: 500
+        severity: high
+      - bodyContains: "UP"
+        severity: high
+
+  - id: info-endpoint
+    name: 服务信息接口
+    tags: ["health"]
+    request:
+      method: GET
+      url: /info
+    assertions:
+      - statusCode: 200
+        severity: critical
+      - jsonPath:
+          path: "$.build.version"
+          operator: regex
+          expected: "^\\d+\\.\\d+\\.\\d+"
+        severity: medium
+      - contract:
+          strict: false
+        severity: medium

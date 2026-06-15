@@ -1,0 +1,14 @@
+# 全局配置
+concurrency: 5
+timeout: 30000
+retries: 1
+variables:
+  appName: "api-regression"
+headers:
+  Accept: "application/json"
+output:
+  html: "reports/report.html"
+  json: "reports/report.json"
+  junit: "reports/junit.xml"
+  snapshots: "reports/snapshots"
+  failed: "reports/failed-tests.json"

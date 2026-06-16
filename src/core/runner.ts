@@ -1,4 +1,5 @@
 import toposort from 'toposort';
+import path from 'path';
 import {
   TestSuite,
   TestCase,
@@ -276,9 +277,11 @@ export class TestRunner {
     for (const test of includedTests) {
       if (test.dataSource) {
         const resolvedDataSource = resolver.resolve(test.dataSource);
+        const baseDir = suite.filePath ? path.dirname(suite.filePath) : process.cwd();
         const dataRows = this.parser.parseDataFile(
           resolvedDataSource.file,
-          resolvedDataSource.type
+          resolvedDataSource.type,
+          baseDir
         );
 
         dataRows.forEach((row, index) => {
@@ -669,9 +672,18 @@ export class TestRunner {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  private getFailedFilePath(): string {
+    if (this.options.failedFile) {
+      return this.options.failedFile;
+    }
+    if (this.globalConfig.output?.failed) {
+      return this.globalConfig.output.failed;
+    }
+    return './.api-regression/failed-tests.json';
+  }
+
   private loadFailedCases(): string[] {
-    const failedFile = this.options.failedFile ||
-      (this.globalConfig.output?.failed || './reports/failed-tests.json');
+    const failedFile = this.getFailedFilePath();
 
     try {
       const fs = require('fs');
@@ -692,9 +704,7 @@ export class TestRunner {
     const fs = require('fs');
     const path = require('path');
 
-    const failedFile = this.options.failedFile ||
-      (this.globalConfig.output?.failed ||
-        (outputDir ? `${outputDir}/failed-tests.json` : './reports/failed-tests.json'));
+    const failedFile = this.getFailedFilePath();
 
     const fullPath = path.resolve(failedFile);
     const dir = path.dirname(fullPath);

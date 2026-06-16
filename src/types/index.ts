@@ -86,6 +86,7 @@ export interface TestSuite {
   name: string;
   description?: string;
   baseUrl?: string;
+  filePath?: string;
   defaults?: {
     headers?: Record<string, string>;
     timeout?: number;

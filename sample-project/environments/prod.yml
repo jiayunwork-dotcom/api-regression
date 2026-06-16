@@ -1,8 +1,0 @@
-# 生产环境配置
-name: production
-baseUrl: https://api.example.com
-variables:
-  token: ${process.env.API_TOKEN}
-  defaultUserId: 100
-headers:
-  X-App-Version: "1.0.0"

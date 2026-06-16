@@ -52,8 +52,13 @@ export class ConfigParser {
     return this.validateGlobalConfig(parsed);
   }
 
-  parseDataFile(filePath: string, type: 'csv' | 'json'): Record<string, any>[] {
-    const absolutePath = path.resolve(filePath);
+  parseDataFile(filePath: string, type: 'csv' | 'json', baseDir?: string): Record<string, any>[] {
+    let absolutePath: string;
+    if (baseDir && !path.isAbsolute(filePath)) {
+      absolutePath = path.resolve(baseDir, filePath);
+    } else {
+      absolutePath = path.resolve(filePath);
+    }
     if (!fs.existsSync(absolutePath)) {
       throw new Error(`数据文件不存在: ${absolutePath}`);
     }
@@ -163,6 +168,7 @@ export class ConfigParser {
       name: suiteName,
       description: raw.description,
       baseUrl: raw.baseUrl,
+      filePath: filePath,
       defaults: raw.defaults ? {
         headers: raw.defaults.headers,
         timeout: raw.defaults.timeout,

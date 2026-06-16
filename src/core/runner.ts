@@ -395,7 +395,7 @@ export class TestRunner {
     }
   }
 
-  private createHttpClient(suite: TestSuite): HttpClient {
+  createHttpClient(suite: TestSuite): HttpClient {
     const defaultTimeout =
       this.options.concurrency !== undefined ? undefined :
       suite.defaults?.timeout ??
@@ -575,7 +575,19 @@ export class TestRunner {
     }
   }
 
-  private async runTestCase(
+  createAuthManager(resolver: VariableResolver): AuthManager {
+    return new AuthManager(resolver);
+  }
+
+  createAssertionEngine(
+    resolver: VariableResolver,
+    snapshotDir: string,
+    updateSnapshots: boolean
+  ): AssertionEngine {
+    return new AssertionEngine(resolver, snapshotDir, updateSnapshots);
+  }
+
+  async runTestCase(
     node: TestNode,
     suite: TestSuite,
     resolver: VariableResolver,

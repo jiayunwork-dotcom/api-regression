@@ -1,0 +1,59 @@
+name: 分布式测试套件2
+description: 第二个测试套件，用于测试多套件并行
+
+config:
+  baseUrl: https://httpbin.org
+
+tests:
+  - id: test-5
+    name: 删除订单
+    description: 测试DELETE请求
+    request:
+      method: DELETE
+      url: /delete
+    assertions:
+      - type: status
+        value: 200
+
+  - id: test-6
+    name: 更新用户
+    description: 测试PUT请求
+    request:
+      method: PUT
+      url: /put
+      body:
+        type: json
+        data:
+          name: testuser
+          email: test@example.com
+    assertions:
+      - type: status
+        value: 200
+      - type: json
+        path: $.json.name
+        value: testuser
+
+  - id: test-7
+    name: 头信息验证
+    description: 测试自定义头信息
+    request:
+      method: GET
+      url: /headers
+      headers:
+        X-Custom-Header: my-custom-value
+    assertions:
+      - type: status
+        value: 200
+      - type: json
+        path: $.headers.X-Custom-Header
+        value: my-custom-value
+
+  - id: test-8
+    name: 延迟测试
+    description: 测试延迟响应
+    request:
+      method: GET
+      url: /delay/1
+    assertions:
+      - type: status
+        value: 200

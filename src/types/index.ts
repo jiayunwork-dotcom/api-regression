@@ -288,3 +288,5 @@ export interface ContractDiff {
   oldType?: string;
   newType?: string;
 }
+
+export * from './distributed';

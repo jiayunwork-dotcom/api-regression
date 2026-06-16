@@ -1,0 +1,72 @@
+name: 分布式测试套件1
+description: 用于测试分布式执行的测试套件
+
+config:
+  baseUrl: https://httpbin.org
+
+tests:
+  - id: test-1
+    name: 获取用户信息
+    description: 测试GET请求获取用户信息
+    request:
+      method: GET
+      url: /get
+      query:
+        userId: 123
+    assertions:
+      - type: status
+        value: 200
+      - type: json
+        path: $.args.userId
+        value: '123'
+    extracts:
+      - name: requestId
+        from: $.headers.X-Amzn-Trace-Id
+
+  - id: test-2
+    name: 创建订单
+    description: 测试POST请求创建订单，依赖test-1的requestId
+    request:
+      method: POST
+      url: /post
+      headers:
+        X-Request-Id: '{{requestId}}'
+      body:
+        type: json
+        data:
+          productId: 456
+          quantity: 2
+    assertions:
+      - type: status
+        value: 200
+      - type: json
+        path: $.data.productId
+        value: 456
+    extracts:
+      - name: orderId
+        from: $.json.orderId
+    dependsOn:
+      - test-1
+
+  - id: test-3
+    name: 健康检查
+    description: 独立的健康检查用例
+    request:
+      method: GET
+      url: /status/200
+    assertions:
+      - type: status
+        value: 200
+
+  - id: test-4
+    name: 查询订单列表
+    description: 独立的查询用例
+    request:
+      method: GET
+      url: /get
+      query:
+        page: 1
+        size: 10
+    assertions:
+      - type: status
+        value: 200

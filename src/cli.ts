@@ -7,6 +7,9 @@ import { RunOptions } from './types';
 import { ConfigParser } from './core/parser';
 import { TestRunner } from './core/runner';
 import { ReportGenerator } from './core/reporter';
+import { TestCoordinator } from './core/distributed/coordinator';
+import { TestWorker } from './core/distributed/worker';
+import { CoordinatorConfig, WorkerConfig } from './types/distributed';
 
 const packageJsonPath = path.join(__dirname, '..', 'package.json');
 let packageJson: any = {};
@@ -106,6 +109,65 @@ async function main() {
         .action((opts: any) => cleanSnapshots(opts.snapshotDir, opts.ids))
     );
 
+  program
+    .command('coordinator')
+    .description('启动分布式测试协调服务')
+    .requiredOption('-p, --port <number>', 'WebSocket服务端口', parseInt)
+    .requiredOption('-s, --suites <paths...>', '测试套件文件或目录路径')
+    .option('--shard-timeout <seconds>', '分片执行超时时间（秒）', parseInt, 300)
+    .option('--max-retries <number>', '失败用例最大重试次数', parseInt, 0)
+    .option('--secret <secret>', '认证共享密钥')
+    .option('-o, --output-dir <path>', '报告输出目录', './reports')
+    .option('--no-html', '不生成HTML报告')
+    .option('--no-json', '不生成JSON报告')
+    .option('--no-junit', '不生成JUnit XML报告')
+    .option('--html', '生成HTML报告')
+    .option('--json', '生成JSON报告')
+    .option('--junit', '生成JUnit XML报告')
+    .option('-e, --environment <name>', '环境名称，用于选择环境配置')
+    .option('--env-file <path>', '环境配置文件路径 (YAML)')
+    .option('-c, --config <path>', '全局配置文件路径 (YAML)')
+    .option('-b, --base-url <url>', '覆盖配置的基础URL')
+    .option('--var <vars...>', '设置运行时变量，格式: key=value')
+    .option('-t, --tags <tags...>', '只执行包含指定标签的用例')
+    .option('--exclude-tags <tags...>', '排除包含指定标签的用例')
+    .option('--shard-count <number>', '目标分片数量，默认按依赖层级自动分配', parseInt)
+    .action(async (cmdOptions: any) => {
+      try {
+        await executeCoordinator(cmdOptions);
+      } catch (error: any) {
+        console.error(chalk.red('\n❌ Coordinator 启动失败:'));
+        console.error(chalk.red(error.message || error));
+        if (cmdOptions.verbose && error.stack) {
+          console.error(chalk.gray(error.stack));
+        }
+        process.exit(1);
+      }
+    });
+
+  program
+    .command('worker')
+    .description('启动分布式测试工作节点')
+    .requiredOption('--coordinator <url>', 'Coordinator WebSocket地址，如 ws://localhost:9800')
+    .requiredOption('--id <workerId>', 'Worker唯一标识')
+    .option('--secret <secret>', '认证共享密钥')
+    .option('-n, --concurrency <number>', '并发执行的用例数量', parseInt, 5)
+    .option('--env-file <path>', '环境配置文件路径 (YAML)')
+    .option('-b, --base-url <url>', '覆盖配置的基础URL')
+    .option('--var <vars...>', '设置运行时变量，格式: key=value')
+    .action(async (cmdOptions: any) => {
+      try {
+        await executeWorker(cmdOptions);
+      } catch (error: any) {
+        console.error(chalk.red('\n❌ Worker 启动失败:'));
+        console.error(chalk.red(error.message || error));
+        if (error.stack) {
+          console.error(chalk.gray(error.stack));
+        }
+        process.exit(1);
+      }
+    });
+
   program.addHelpText('after', `
 示例:
   ${chalk.cyan('# 执行单个测试套件')}
@@ -125,6 +187,22 @@ async function main() {
 
   ${chalk.cyan('# 创建示例项目')}
   $ api-regression init ./tests
+
+  ${chalk.cyan('# 启动分布式测试协调服务')}
+  $ api-regression coordinator --port 9800 --suites ./tests/ --secret my-secret-key
+
+  ${chalk.cyan('# 启动 Worker 节点')}
+  $ api-regression worker --coordinator ws://localhost:9800 --id node-1 --secret my-secret-key
+
+  ${chalk.cyan('# 启动多个 Worker 并行执行')}
+  $ api-regression worker --coordinator ws://localhost:9800 --id node-2 --secret my-secret-key
+  $ api-regression worker --coordinator ws://localhost:9800 --id node-3 --secret my-secret-key
+
+  ${chalk.cyan('# 指定分片超时和重试次数')}
+  $ api-regression coordinator --port 9800 --suites ./tests/ --shard-timeout 600 --max-retries 2
+
+  ${chalk.cyan('# 查看实时状态')}
+  $ curl http://localhost:9800/status
   `);
 
   await program.parseAsync(process.argv);
@@ -249,6 +327,120 @@ function parseVarValue(value: string): any {
     // ignore
   }
   return value;
+}
+
+async function executeCoordinator(cmdOptions: any): Promise<void> {
+  const runtimeVars: Record<string, any> = {};
+  if (cmdOptions.var) {
+    for (const kv of cmdOptions.var) {
+      const eqIdx = kv.indexOf('=');
+      if (eqIdx > 0) {
+        const key = kv.slice(0, eqIdx);
+        const value = kv.slice(eqIdx + 1);
+        runtimeVars[key] = parseVarValue(value);
+      }
+    }
+  }
+
+  const suitePaths: string[] = [];
+  const parser = new ConfigParser();
+  for (const p of cmdOptions.suites) {
+    const fullPath = path.resolve(p);
+    const stat = fs.existsSync(fullPath) ? fs.statSync(fullPath) : null;
+    if (stat && stat.isDirectory()) {
+      suitePaths.push(...parser.discoverSuites(fullPath));
+    } else if (fullPath.endsWith('.yml') || fullPath.endsWith('.yaml')) {
+      suitePaths.push(fullPath);
+    }
+  }
+
+  if (suitePaths.length === 0) {
+    throw new Error('未找到任何 YAML 测试套件文件');
+  }
+
+  const secret = cmdOptions.secret || process.env.API_REGRESSION_SECRET;
+  if (!secret) {
+    console.log(chalk.yellow(
+      '⚠️  警告: 未设置认证密钥 (--secret 或 API_REGRESSION_SECRET 环境变量)，通信将不进行认证'
+    ));
+  }
+
+  const config: CoordinatorConfig = {
+    port: cmdOptions.port,
+    suitePaths,
+    shardTimeout: (cmdOptions.shardTimeout || 300) * 1000,
+    maxRetries: cmdOptions.maxRetries || 0,
+    secret,
+    outputDir: cmdOptions.outputDir || './reports',
+    htmlReport: cmdOptions.html !== false,
+    jsonReport: cmdOptions.json !== false,
+    junitReport: cmdOptions.junit !== false,
+    environmentFile: cmdOptions.envFile,
+    configFile: cmdOptions.config,
+    baseUrl: cmdOptions.baseUrl,
+    variables: Object.keys(runtimeVars).length > 0 ? runtimeVars : undefined,
+    tags: cmdOptions.tags,
+    excludeTags: cmdOptions.excludeTags,
+    targetShardCount: cmdOptions.shardCount,
+  };
+
+  const coordinator = new TestCoordinator(config);
+
+  try {
+    const summary = await coordinator.start();
+
+    const hasCriticalFailures = summary.suiteResults.some((suite: any) =>
+      suite.testResults.some((test: any) =>
+        test.assertions.some((a: any) =>
+          !a.passed && (a.severity === 'critical' || a.severity === 'high')
+        )
+      )
+    );
+
+    if (hasCriticalFailures || summary.failedTests > 0) {
+      process.exit(1);
+    }
+  } catch (error: any) {
+    console.error(chalk.red(`\n❌ 执行失败: ${error.message}`));
+    coordinator.stop();
+    process.exit(1);
+  }
+}
+
+async function executeWorker(cmdOptions: any): Promise<void> {
+  const runtimeVars: Record<string, any> = {};
+  if (cmdOptions.var) {
+    for (const kv of cmdOptions.var) {
+      const eqIdx = kv.indexOf('=');
+      if (eqIdx > 0) {
+        const key = kv.slice(0, eqIdx);
+        const value = kv.slice(eqIdx + 1);
+        runtimeVars[key] = parseVarValue(value);
+      }
+    }
+  }
+
+  const secret = cmdOptions.secret || process.env.API_REGRESSION_SECRET;
+
+  const config: WorkerConfig = {
+    coordinatorUrl: cmdOptions.coordinator,
+    workerId: cmdOptions.id,
+    secret,
+    concurrency: cmdOptions.concurrency,
+    environmentFile: cmdOptions.envFile,
+    baseUrl: cmdOptions.baseUrl,
+    variables: Object.keys(runtimeVars).length > 0 ? runtimeVars : undefined,
+  };
+
+  const worker = new TestWorker(config);
+
+  try {
+    await worker.start();
+  } catch (error: any) {
+    console.error(chalk.red(`\n❌ Worker 执行失败: ${error.message}`));
+    worker.stop();
+    process.exit(1);
+  }
 }
 
 async function listTests(dirPath: string, opts: any): Promise<void> {

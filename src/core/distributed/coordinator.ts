@@ -151,7 +151,7 @@ export class TestCoordinator {
     this.server.on('upgrade', (request, socket, head) => {
       const parsedUrl = url.parse(request.url || '');
       const pathname = parsedUrl.pathname;
-      if (pathname === '/ws') {
+      if (pathname === '/ws' || pathname === '/' || pathname === '') {
         this.wss.handleUpgrade(request, socket, head, ws => {
           this.handleWebSocketConnection(ws, request);
         });
@@ -264,7 +264,8 @@ export class TestCoordinator {
       return;
     }
 
-    if (this.workers.has(message.workerId)) {
+    const workerExists = this.getWorkerById(message.workerId);
+    if (workerExists) {
       console.log(chalk.yellow(`⚠️  Worker ID 重复: ${message.workerId}，拒绝连接`));
       this.sendMessage(ws, {
         type: 'auth_failed',

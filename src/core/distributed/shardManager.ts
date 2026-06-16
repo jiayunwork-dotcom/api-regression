@@ -263,126 +263,168 @@ export class ShardManager {
     const includedTests = this.filterByTags(suite.tests);
     if (includedTests.length === 0) return [];
 
-    const allIds = new Set(includedTests.map(t => t.id));
-    const sortedIds = toposort(graph.dependencies);
-    for (const id of allIds) {
-      if (!sortedIds.includes(id)) {
-        sortedIds.unshift(id);
-      }
-    }
-
+    const allIds = includedTests.map(t => t.id);
     const idToTest = new Map(includedTests.map(t => [t.id, t]));
 
-    const groups: string[][] = [];
-    const inDegree = new Map<string, number>();
-
+    const parent = new Map<string, string>();
     for (const id of allIds) {
-      let degree = 0;
-      for (const [from, to] of graph.dependencies) {
-        if (to === id && allIds.has(from)) {
-          degree++;
-        }
-      }
-      inDegree.set(id, degree);
+      parent.set(id, id);
     }
 
-    const remaining = new Set(sortedIds);
-    while (remaining.size > 0) {
-      const currentGroup: string[] = [];
-      for (const id of sortedIds) {
-        if (remaining.has(id) && (inDegree.get(id) || 0) === 0) {
-          currentGroup.push(id);
-          remaining.delete(id);
+    const find = (x: string): string => {
+      if (parent.get(x) !== x) {
+        parent.set(x, find(parent.get(x)!));
+      }
+      return parent.get(x)!;
+    };
+
+    const union = (x: string, y: string): void => {
+      const rx = find(x);
+      const ry = find(y);
+      if (rx !== ry) {
+        parent.set(ry, rx);
+      }
+    };
+
+    for (const [from, to] of graph.dependencies) {
+      if (allIds.includes(from) && allIds.includes(to)) {
+        union(from, to);
+      }
+    }
+
+    const groupsMap = new Map<string, string[]>();
+    for (const id of allIds) {
+      const root = find(id);
+      if (!groupsMap.has(root)) {
+        groupsMap.set(root, []);
+      }
+      groupsMap.get(root)!.push(id);
+    }
+
+    let sortedGroups: string[][] = [];
+    try {
+      const sortedIds = toposort(graph.dependencies);
+      for (const id of allIds) {
+        if (!sortedIds.includes(id)) {
+          sortedIds.unshift(id);
         }
       }
-
-      if (currentGroup.length === 0) {
-        const firstRemaining = remaining.values().next();
-        if (firstRemaining.value !== undefined) {
-          currentGroup.push(firstRemaining.value);
-          remaining.delete(firstRemaining.value);
-        }
-      }
-
-      for (const id of currentGroup) {
-        for (const [from, to] of graph.dependencies) {
-          if (from === id && remaining.has(to)) {
-            inDegree.set(to, (inDegree.get(to) || 0) - 1);
+      const groupOrder = new Map<string, number>();
+      for (const [root, members] of groupsMap) {
+        let minIndex = Infinity;
+        for (const member of members) {
+          const idx = sortedIds.indexOf(member);
+          if (idx !== -1 && idx < minIndex) {
+            minIndex = idx;
           }
         }
+        groupOrder.set(root, minIndex);
       }
-
-      groups.push(currentGroup);
+      sortedGroups = Array.from(groupsMap.values()).sort((a, b) => {
+        const orderA = groupOrder.get(find(a[0])) || 0;
+        const orderB = groupOrder.get(find(b[0])) || 0;
+        return orderA - orderB;
+      });
+    } catch {
+      sortedGroups = Array.from(groupsMap.values());
     }
 
-    const numWorkers = targetShardCount || groups.length;
-    const shards: TestShard[] = [];
+    const numWorkers = targetShardCount || Math.max(1, sortedGroups.length);
 
-    for (let level = 0; level < groups.length; level++) {
-      const groupIds = groups[level];
-      const groupTests = groupIds
+    const groupsWithSize: Array<{ ids: string[]; size: number }> = sortedGroups.map(ids => ({
+      ids,
+      size: ids.length,
+    }));
+
+    const buckets: Array<{ ids: string[]; totalSize: number }> = [];
+    for (let i = 0; i < Math.min(numWorkers, sortedGroups.length); i++) {
+      buckets.push({ ids: [], totalSize: 0 });
+    }
+
+    for (const group of groupsWithSize) {
+      let minBucket = buckets[0];
+      let minIndex = 0;
+      for (let i = 1; i < buckets.length; i++) {
+        if (buckets[i].totalSize < minBucket.totalSize) {
+          minBucket = buckets[i];
+          minIndex = i;
+        }
+      }
+      minBucket.ids.push(...group.ids);
+      minBucket.totalSize += group.size;
+    }
+
+    const shards: TestShard[] = [];
+    for (let bucketIndex = 0; bucketIndex < buckets.length; bucketIndex++) {
+      const bucket = buckets[bucketIndex];
+      if (bucket.ids.length === 0) continue;
+
+      const shardTests = bucket.ids
         .map(id => idToTest.get(id)!)
         .filter(Boolean);
 
-      if (groupTests.length === 0) continue;
+      if (shardTests.length === 0) continue;
 
-      const shardSize = Math.max(1, Math.ceil(groupTests.length / Math.min(numWorkers, groupTests.length)));
+      const shardId = `shard-${suite.id}-${bucketIndex}-${uuidv4().slice(0, 8)}`;
 
-      for (let i = 0; i < groupTests.length; i += shardSize) {
-        const shardTests = groupTests.slice(i, i + shardSize);
-        const shardId = `shard-${suite.id}-${level}-${Math.floor(i / shardSize)}-${uuidv4().slice(0, 8)}`;
+      const providedVariables = new Set<string>();
+      const requiredVariables = new Set<string>();
 
-        const providedVariables = new Set<string>();
-        const requiredVariables = new Set<string>();
+      for (const test of shardTests) {
+        const provides = graph.testCaseProvides.get(test.id) || [];
+        const consumes = graph.testCaseConsumes.get(test.id) || [];
 
-        for (const test of shardTests) {
-          const provides = graph.testCaseProvides.get(test.id) || [];
-          const consumes = graph.testCaseConsumes.get(test.id) || [];
-
-          for (const v of provides) {
-            providedVariables.add(v);
-          }
-          for (const v of consumes) {
-            const isProvidedInShard = shardTests.some(t =>
-              (graph.testCaseProvides.get(t.id) || []).includes(v)
-            );
-            if (!isProvidedInShard && !this.isGlobalVariable(v)) {
-              requiredVariables.add(v);
-            }
-          }
+        for (const v of provides) {
+          providedVariables.add(v);
         }
-
-        const dependsOnShards: string[] = [];
-        for (const existingShard of shards) {
-          const hasDependency = shardTests.some((test: TestCase) => {
-            const deps = test.dependsOn || [];
-            return deps.some((depId: string) =>
-              existingShard.testCases.some((tc: TestCase) => tc.id === depId)
-            );
-          });
-
-          const varDependency = Array.from(requiredVariables).some(v =>
-            existingShard.providedVariables.includes(v)
+        for (const v of consumes) {
+          const isProvidedInShard = shardTests.some(t =>
+            (graph.testCaseProvides.get(t.id) || []).includes(v)
           );
-
-          if (hasDependency || varDependency) {
-            if (!dependsOnShards.includes(existingShard.id)) {
-              dependsOnShards.push(existingShard.id);
-            }
+          if (!isProvidedInShard && !this.isGlobalVariable(v)) {
+            requiredVariables.add(v);
           }
         }
-
-        shards.push({
-          id: shardId,
-          suiteId: suite.id,
-          suite: { ...suite, tests: [] },
-          testCases: shardTests,
-          dependencyLevel: level,
-          requiredVariables: Array.from(requiredVariables),
-          providedVariables: Array.from(providedVariables),
-          dependsOnShards,
-        });
       }
+
+      const dependsOnShards: string[] = [];
+      for (const existingShard of shards) {
+        const hasDependency = shardTests.some((test: TestCase) => {
+          const deps = test.dependsOn || [];
+          return deps.some((depId: string) =>
+            existingShard.testCases.some((tc: TestCase) => tc.id === depId)
+          );
+        });
+
+        const varDependency = Array.from(requiredVariables).some(v =>
+          existingShard.providedVariables.includes(v)
+        );
+
+        if (hasDependency || varDependency) {
+          if (!dependsOnShards.includes(existingShard.id)) {
+            dependsOnShards.push(existingShard.id);
+          }
+        }
+      }
+
+      let dependencyLevel = 0;
+      for (const depShardId of dependsOnShards) {
+        const depShard = shards.find(s => s.id === depShardId);
+        if (depShard && depShard.dependencyLevel >= dependencyLevel) {
+          dependencyLevel = depShard.dependencyLevel + 1;
+        }
+      }
+
+      shards.push({
+        id: shardId,
+        suiteId: suite.id,
+        suite: { ...suite, tests: [] },
+        testCases: shardTests,
+        dependencyLevel,
+        requiredVariables: Array.from(requiredVariables),
+        providedVariables: Array.from(providedVariables),
+        dependsOnShards,
+      });
     }
 
     return shards;

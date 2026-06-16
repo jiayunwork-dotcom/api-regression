@@ -10,12 +10,16 @@ import {
   AssertionResult,
   SeverityLevel,
   EnvironmentConfig,
-  GlobalConfig
+  GlobalConfig,
+  HookExecutionResult,
+  HookConfig,
+  AuthConfig
 } from '../types';
 import { HttpClient, HttpRequestError, ReceivedResponse, SentRequest } from './httpClient';
 import { VariableResolver } from './variables';
 import { AssertionEngine } from './assertions';
 import { ConfigParser } from './parser';
+import { AuthManager } from './auth';
 
 export interface TestRunContext {
   suite: TestSuite;
@@ -92,6 +96,7 @@ export class TestRunner {
   private async runSuite(suite: TestSuite): Promise<SuiteExecutionResult> {
     const startTime = Date.now();
     const resolver = this.createSuiteResolver(suite);
+    const authManager = new AuthManager(resolver);
     const snapshotDir = this.options.outputDir
       ? `${this.options.outputDir}/snapshots`
       : (this.globalConfig.output?.snapshots || './reports/snapshots');
@@ -102,84 +107,128 @@ export class TestRunner {
       this.options.updateSnapshots || false
     );
 
-    const nodes = this.expandTestCases(suite, resolver);
-    const executionGroups = this.buildExecutionGroups(nodes);
+    let envConfig: EnvironmentConfig | undefined;
+    if (this.options.environmentFile) {
+      envConfig = this.parser.parseEnvironment(this.options.environmentFile);
+    }
 
-    const failedCaseIds = new Set<string>();
-    const skippedCaseIds = new Set<string>();
-    const testResults: ExecutionResult[] = [];
-    const concurrency = this.options.concurrency ?? this.globalConfig.concurrency ?? 5;
+    let setupResult: HookExecutionResult | undefined;
+    let teardownResult: HookExecutionResult | undefined;
+    let suiteSkipped = false;
+    let suiteSkipReason = '';
 
-    let stopSuite = false;
-
-    for (const group of executionGroups) {
-      if (stopSuite) {
-        for (const node of group) {
-          const skipResult = this.createSkippedResult(node, suite, '因停止执行而跳过');
-          testResults.push(skipResult);
+    try {
+      if (suite.auth?.type === 'oauth2_client_credentials') {
+        try {
+          await authManager.resolveAuthHeaderAsync(suite.auth);
+        } catch (e: any) {
+          suiteSkipped = true;
+          suiteSkipReason = `OAuth2 认证失败: ${e.message}`;
         }
-        continue;
       }
+    } catch (e: any) {
+      suiteSkipped = true;
+      suiteSkipReason = `认证初始化失败: ${e.message}`;
+    }
 
-      const independentNodes = group.filter(node => {
-        const skippedByDependency = node.test.dependsOn?.some(depId =>
-          failedCaseIds.has(depId) || skippedCaseIds.has(depId)
-        );
-        if (skippedByDependency) {
-          const failedDep = node.test.dependsOn!.find(depId => failedCaseIds.has(depId));
-          const skipReason = failedDep
-            ? `依赖的用例 [${failedDep}] 执行失败`
-            : `依赖的用例已跳过`;
-          const skipResult = this.createSkippedResult(node, suite, skipReason);
-          testResults.push(skipResult);
-          skippedCaseIds.add(node.originalId);
-          return false;
+    if (!suiteSkipped && suite.setup) {
+      setupResult = await this.runHook(suite, suite.setup, 'setup', resolver, httpClient, authManager, envConfig);
+      if (setupResult.status === 'failed') {
+        suiteSkipped = true;
+        suiteSkipReason = `Setup 钩子执行失败: ${setupResult.error || setupResult.message || '未知错误'}`;
+      }
+    }
+
+    const testResults: ExecutionResult[] = [];
+    if (suiteSkipped) {
+      const nodes = this.expandTestCases(suite, resolver);
+      for (const node of nodes) {
+        const skipResult = this.createSkippedResult(node, suite, suiteSkipReason);
+        testResults.push(skipResult);
+      }
+    } else {
+      const nodes = this.expandTestCases(suite, resolver);
+      const executionGroups = this.buildExecutionGroups(nodes);
+
+      const failedCaseIds = new Set<string>();
+      const skippedCaseIds = new Set<string>();
+      const concurrency = this.options.concurrency ?? this.globalConfig.concurrency ?? 5;
+
+      let stopSuite = false;
+
+      for (const group of executionGroups) {
+        if (stopSuite) {
+          for (const node of group) {
+            const skipResult = this.createSkippedResult(node, suite, '因停止执行而跳过');
+            testResults.push(skipResult);
+          }
+          continue;
         }
 
-        if (this.options.onlyFailed) {
-          const savedFailed = this.loadFailedCases();
-          if (!savedFailed.includes(node.originalId)) {
-            const skipResult = this.createSkippedResult(node, suite, '仅执行失败用例模式，本次跳过');
+        const independentNodes = group.filter(node => {
+          const skippedByDependency = node.test.dependsOn?.some(depId =>
+            failedCaseIds.has(depId) || skippedCaseIds.has(depId)
+          );
+          if (skippedByDependency) {
+            const failedDep = node.test.dependsOn!.find(depId => failedCaseIds.has(depId));
+            const skipReason = failedDep
+              ? `依赖的用例 [${failedDep}] 执行失败`
+              : `依赖的用例已跳过`;
+            const skipResult = this.createSkippedResult(node, suite, skipReason);
+            testResults.push(skipResult);
+            skippedCaseIds.add(node.originalId);
+            return false;
+          }
+
+          if (this.options.onlyFailed) {
+            const savedFailed = this.loadFailedCases();
+            if (!savedFailed.includes(node.originalId)) {
+              const skipResult = this.createSkippedResult(node, suite, '仅执行失败用例模式，本次跳过');
+              testResults.push(skipResult);
+              return false;
+            }
+          }
+
+          if (node.test.skip) {
+            const skipResult = this.createSkippedResult(node, suite, '用例标记为跳过');
             testResults.push(skipResult);
             return false;
           }
-        }
 
-        if (node.test.skip) {
-          const skipResult = this.createSkippedResult(node, suite, '用例标记为跳过');
-          testResults.push(skipResult);
-          return false;
-        }
+          return true;
+        });
 
-        return true;
-      });
+        const chunkSize = Math.max(1, concurrency);
+        for (let i = 0; i < independentNodes.length; i += chunkSize) {
+          const chunk = independentNodes.slice(i, i + chunkSize);
+          const results = await Promise.all(
+            chunk.map(node => this.runTestCase(node, suite, resolver, httpClient, assertionEngine, authManager, envConfig))
+          );
 
-      const chunkSize = Math.max(1, concurrency);
-      for (let i = 0; i < independentNodes.length; i += chunkSize) {
-        const chunk = independentNodes.slice(i, i + chunkSize);
-        const results = await Promise.all(
-          chunk.map(node => this.runTestCase(node, suite, resolver, httpClient, assertionEngine))
-        );
+          for (let j = 0; j < chunk.length; j++) {
+            const node = chunk[j];
+            const result = results[j];
+            testResults.push(result);
 
-        for (let j = 0; j < chunk.length; j++) {
-          const node = chunk[j];
-          const result = results[j];
-          testResults.push(result);
-
-          if (result.status === 'failed') {
-            failedCaseIds.add(node.originalId);
-            if (this.options.stopOnFailure) {
-              stopSuite = true;
+            if (result.status === 'failed') {
+              failedCaseIds.add(node.originalId);
+              if (this.options.stopOnFailure) {
+                stopSuite = true;
+              }
             }
-          }
 
-          if (Object.keys(result.extractedVariables).length > 0) {
-            for (const [key, value] of Object.entries(result.extractedVariables)) {
-              resolver.addExtractedVar(key, value);
+            if (Object.keys(result.extractedVariables).length > 0) {
+              for (const [key, value] of Object.entries(result.extractedVariables)) {
+                resolver.addExtractedVar(key, value);
+              }
             }
           }
         }
       }
+    }
+
+    if (suite.teardown) {
+      teardownResult = await this.runHook(suite, suite.teardown, 'teardown', resolver, httpClient, authManager, envConfig);
     }
 
     const endTime = Date.now();
@@ -197,6 +246,8 @@ export class TestRunner {
       endTime,
       duration: endTime - startTime,
       testResults,
+      setupResult,
+      teardownResult,
       summary
     };
   }
@@ -253,6 +304,95 @@ export class TestRunner {
     }
 
     return resolver;
+  }
+
+  private async runHook(
+    suite: TestSuite,
+    hook: HookConfig,
+    hookName: 'setup' | 'teardown',
+    resolver: VariableResolver,
+    httpClient: HttpClient,
+    authManager: AuthManager,
+    envConfig?: EnvironmentConfig
+  ): Promise<HookExecutionResult> {
+    const startTime = Date.now();
+    let finalBaseUrl: string | undefined;
+    const allVars = resolver.getAllVars();
+    finalBaseUrl = (allVars.base_url as string) || (allVars.suite_base_url as string) || suite.baseUrl;
+
+    try {
+      const authHeaders = await authManager.mergeAuthHeadersAsync(
+        hook.request,
+        envConfig?.auth,
+        suite.auth,
+        undefined
+      );
+
+      const hookRequest = {
+        ...hook.request,
+        headers: {
+          ...(hook.request.headers || {}),
+          ...authHeaders
+        }
+      };
+
+      const { request, response } = await httpClient.send(
+        hookRequest,
+        resolver,
+        finalBaseUrl
+      );
+
+      let extractedVars: Record<string, any> = {};
+      if (hook.extracts && hook.extracts.length > 0) {
+        extractedVars = resolver.extractFromResponse(hook.extracts, {
+          status: response.status,
+          headers: response.headers,
+          body: response.body,
+          cookies: response.cookies
+        });
+        for (const [key, value] of Object.entries(extractedVars)) {
+          resolver.addExtractedVar(key, value);
+        }
+      }
+
+      const endTime = Date.now();
+      return {
+        name: hookName,
+        status: response.status >= 200 && response.status < 300 ? 'passed' : 'failed',
+        startTime,
+        endTime,
+        duration: endTime - startTime,
+        request: {
+          method: request.method,
+          url: request.url,
+          headers: request.headers,
+          body: request.body
+        },
+        response: {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+          body: response.body,
+          time: response.time
+        },
+        extractedVariables: extractedVars,
+        message: response.status >= 200 && response.status < 300
+          ? `${hookName} 钩子执行成功`
+          : `${hookName} 钩子返回非成功状态码: ${response.status}`
+      };
+    } catch (error: any) {
+      const endTime = Date.now();
+      return {
+        name: hookName,
+        status: 'failed',
+        startTime,
+        endTime,
+        duration: endTime - startTime,
+        extractedVariables: {},
+        error: error.stack || error.message,
+        message: `${hookName} 钩子执行失败: ${error.message}`
+      };
+    }
   }
 
   private createHttpClient(suite: TestSuite): HttpClient {
@@ -440,7 +580,9 @@ export class TestRunner {
     suite: TestSuite,
     resolver: VariableResolver,
     httpClient: HttpClient,
-    assertionEngine: AssertionEngine
+    assertionEngine: AssertionEngine,
+    authManager: AuthManager,
+    envConfig?: EnvironmentConfig
   ): Promise<ExecutionResult> {
     const startTime = Date.now();
     const test = node.test;
@@ -466,6 +608,21 @@ export class TestRunner {
       httpClient.setDefaultHeaders(globalHeaders);
     }
 
+    const authHeaders = await authManager.mergeAuthHeadersAsync(
+      test.request,
+      envConfig?.auth,
+      suite.auth,
+      test.auth
+    );
+
+    const requestWithAuth = {
+      ...test.request,
+      headers: {
+        ...(test.request.headers || {}),
+        ...authHeaders
+      }
+    };
+
     const maxAttempts = test.retry?.maxAttempts ?? this.globalConfig.retries ?? 1;
     const retryDelay = test.retry?.delayMs ?? 1000;
 
@@ -476,7 +633,7 @@ export class TestRunner {
       attempts = attempt;
       try {
         const { request, response } = await httpClient.send(
-          test.request,
+          requestWithAuth,
           resolver,
           finalBaseUrl
         );

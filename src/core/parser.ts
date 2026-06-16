@@ -1,7 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 import YAML from 'yaml';
-import { TestSuite, TestCase, EnvironmentConfig, GlobalConfig } from '../types';
+import {
+  TestSuite,
+  TestCase,
+  EnvironmentConfig,
+  GlobalConfig,
+  RequestConfig,
+  AuthConfig,
+  HookConfig,
+  ExtractConfig
+} from '../types';
 
 export class ConfigParser {
   parseSuite(filePath: string): TestSuite {
@@ -177,8 +186,89 @@ export class ConfigParser {
       before: raw.before ? {
         variables: raw.before.variables
       } : undefined,
+      setup: raw.setup ? this.validateHook(raw.setup, suiteId, 'setup', filePath) : undefined,
+      teardown: raw.teardown ? this.validateHook(raw.teardown, suiteId, 'teardown', filePath) : undefined,
+      auth: raw.auth ? this.validateAuth(raw.auth, suiteId, filePath) : undefined,
       tests
     };
+  }
+
+  private validateHook(raw: any, ownerId: string, hookName: string, filePath: string): HookConfig {
+    if (!raw.request) {
+      throw new Error(`${ownerId} 的 ${hookName} 钩子缺少 request 配置: ${filePath}`);
+    }
+
+    return {
+      request: this.validateRequest(raw.request, `${ownerId} ${hookName}`, filePath),
+      extracts: raw.extracts ? this.validateExtracts(raw.extracts, `${ownerId} ${hookName}`, filePath) : undefined
+    };
+  }
+
+  private validateAuth(raw: any, ownerId: string, filePath: string): AuthConfig {
+    if (!raw.type) {
+      throw new Error(`${ownerId} 的 auth 配置缺少 type 字段: ${filePath}`);
+    }
+
+    switch (raw.type) {
+      case 'bearer':
+        if (!raw.token) {
+          throw new Error(`${ownerId} 的 bearer 认证缺少 token 字段: ${filePath}`);
+        }
+        return { type: 'bearer', token: raw.token };
+      case 'basic':
+        if (!raw.username || !raw.password) {
+          throw new Error(`${ownerId} 的 basic 认证缺少 username 或 password 字段: ${filePath}`);
+        }
+        return { type: 'basic', username: raw.username, password: raw.password };
+      case 'oauth2_client_credentials':
+        if (!raw.token_url || !raw.client_id || !raw.client_secret) {
+          throw new Error(`${ownerId} 的 oauth2_client_credentials 认证缺少必要字段 (token_url, client_id, client_secret): ${filePath}`);
+        }
+        return {
+          type: 'oauth2_client_credentials',
+          token_url: raw.token_url,
+          client_id: raw.client_id,
+          client_secret: raw.client_secret,
+          scope: raw.scope,
+          header_prefix: raw.header_prefix
+        };
+      case 'none':
+        return { type: 'none' };
+      default:
+        throw new Error(`${ownerId} 的 auth 配置使用了未知的 type: ${raw.type}, 支持的类型: bearer, basic, oauth2_client_credentials, none`);
+    }
+  }
+
+  private validateRequest(raw: any, ownerId: string, filePath: string): RequestConfig {
+    const { method, url } = raw;
+    if (!method || !['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())) {
+      throw new Error(`无效的HTTP方法: ${method} in ${ownerId} (${filePath})`);
+    }
+    if (!url) {
+      throw new Error(`缺少请求URL: ${ownerId} in ${filePath}`);
+    }
+
+    return {
+      method: method.toUpperCase(),
+      url,
+      headers: raw.headers,
+      body: raw.body,
+      queryParams: raw.queryParams,
+      timeout: raw.timeout,
+      followRedirects: raw.followRedirects
+    };
+  }
+
+  private validateExtracts(raw: any[], ownerId: string, filePath: string): ExtractConfig[] {
+    return raw.map((e: any, idx: number) => {
+      if (!e.name) {
+        throw new Error(`${ownerId} 的 extracts[${idx}] 缺少 name 字段: ${filePath}`);
+      }
+      if (!e.from) {
+        throw new Error(`${ownerId} 的 extracts[${idx}] 缺少 from 字段: ${filePath}`);
+      }
+      return e as ExtractConfig;
+    });
   }
 
   private validateTestCase(raw: any, testId: string, filePath: string): TestCase {
@@ -229,7 +319,8 @@ export class ConfigParser {
       })),
       dataSource: raw.dataSource,
       retry: raw.retry,
-      skip: raw.skip
+      skip: raw.skip,
+      auth: raw.auth ? this.validateAuth(raw.auth, testId, filePath) : undefined
     };
 
     return testCase;
@@ -247,7 +338,8 @@ export class ConfigParser {
       name: raw.name,
       baseUrl: raw.baseUrl,
       variables: raw.variables,
-      headers: raw.headers
+      headers: raw.headers,
+      auth: raw.auth ? this.validateAuth(raw.auth, `环境 ${raw.name}`, filePath) : undefined
     };
   }
 

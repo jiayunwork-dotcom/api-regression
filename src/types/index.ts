@@ -2,6 +2,35 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 
 
 export type SeverityLevel = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
+export type AuthType = 'bearer' | 'basic' | 'oauth2_client_credentials' | 'none';
+
+export interface BearerAuthConfig {
+  type: 'bearer';
+  token: string;
+}
+
+export interface BasicAuthConfig {
+  type: 'basic';
+  username: string;
+  password: string;
+}
+
+export interface OAuth2ClientCredentialsConfig {
+  type: 'oauth2_client_credentials';
+  token_url: string;
+  client_id: string;
+  client_secret: string;
+  scope?: string;
+  header_prefix?: string;
+}
+
+export type AuthConfig = BearerAuthConfig | BasicAuthConfig | OAuth2ClientCredentialsConfig | { type: 'none' };
+
+export interface HookConfig {
+  request: RequestConfig;
+  extracts?: ExtractConfig[];
+}
+
 export type AssertionOperator =
   | 'eq'
   | 'neq'
@@ -79,6 +108,7 @@ export interface TestCase {
     delayMs?: number;
   };
   skip?: boolean;
+  auth?: AuthConfig;
 }
 
 export interface TestSuite {
@@ -95,6 +125,9 @@ export interface TestSuite {
   before?: {
     variables?: Record<string, any>;
   };
+  setup?: HookConfig;
+  teardown?: HookConfig;
+  auth?: AuthConfig;
   tests: TestCase[];
 }
 
@@ -103,6 +136,7 @@ export interface EnvironmentConfig {
   baseUrl: string;
   variables?: Record<string, any>;
   headers?: Record<string, string>;
+  auth?: AuthConfig;
 }
 
 export interface GlobalConfig {
@@ -163,6 +197,30 @@ export interface ExecutionResult {
   retryAttempts?: number;
 }
 
+export interface HookExecutionResult {
+  name: 'setup' | 'teardown';
+  status: 'passed' | 'failed' | 'skipped';
+  startTime: number;
+  endTime: number;
+  duration: number;
+  request?: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: any;
+  };
+  response?: {
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+    body: any;
+    time: number;
+  } | null;
+  extractedVariables: Record<string, any>;
+  error?: string;
+  message?: string;
+}
+
 export interface SuiteExecutionResult {
   suiteId: string;
   suiteName: string;
@@ -170,6 +228,8 @@ export interface SuiteExecutionResult {
   endTime: number;
   duration: number;
   testResults: ExecutionResult[];
+  setupResult?: HookExecutionResult;
+  teardownResult?: HookExecutionResult;
   summary: {
     total: number;
     passed: number;

@@ -1,7 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 import chalk from 'chalk';
-import { RunSummary, ExecutionResult, AssertionResult, SuiteExecutionResult, SeverityLevel } from '../types';
+import {
+  RunSummary,
+  ExecutionResult,
+  AssertionResult,
+  SuiteExecutionResult,
+  SeverityLevel,
+  HookExecutionResult
+} from '../types';
 
 const severityColors: Record<SeverityLevel, chalk.Chalk> = {
   critical: chalk.bgRed.white,
@@ -53,10 +60,64 @@ export class ReportGenerator {
         chalk.gray(`(${suite.suiteId}) - ${totalTime}s`)
       );
 
+      if (suite.setupResult) {
+        this.printHookResult(suite.setupResult);
+      }
+
       for (const test of suite.testResults) {
         this.printTestResult(test);
       }
+
+      if (suite.teardownResult) {
+        this.printHookResult(suite.teardownResult);
+      }
       console.log('');
+    }
+  }
+
+  private printHookResult(hook: HookExecutionResult): void {
+    const indent = '  ';
+    let statusIcon: string;
+    let statusColor: chalk.Chalk;
+
+    switch (hook.status) {
+      case 'passed':
+        statusIcon = '✅';
+        statusColor = chalk.green;
+        break;
+      case 'failed':
+        statusIcon = hook.name === 'teardown' ? '⚠️' : '❌';
+        statusColor = hook.name === 'teardown' ? chalk.yellow : chalk.red;
+        break;
+      case 'skipped':
+        statusIcon = '⏭️';
+        statusColor = chalk.yellow;
+        break;
+    }
+
+    const duration = hook.duration >= 1000
+      ? `${(hook.duration / 1000).toFixed(2)}s`
+      : `${hook.duration}ms`;
+
+    const hookLabel = hook.name === 'setup' ? 'Setup' : 'Teardown';
+    console.log(
+      `${indent}${statusIcon} ${statusColor(`${hookLabel} 钩子`)} ` +
+      chalk.gray(`- ${duration}`)
+    );
+
+    if (hook.status === 'failed') {
+      const warningPrefix = hook.name === 'teardown' ? '⚠️ 警告' : '❌ 错误';
+      const warningColor = hook.name === 'teardown' ? chalk.yellow : chalk.red;
+      console.log(warningColor(`${indent}   ⤷ ${warningPrefix}: ${hook.message || hook.error || '执行失败'}`));
+    }
+
+    if (this.verbose && hook.request && hook.response) {
+      console.log(chalk.gray(`${indent}   📡 ${hook.request.method} ${hook.request.url}`));
+      console.log(chalk.gray(`${indent}   📨 状态码: ${hook.response.status} | 响应时间: ${hook.response.time}ms`));
+    }
+
+    if (Object.keys(hook.extractedVariables).length > 0 && this.verbose) {
+      console.log(chalk.gray(`${indent}   📦 提取变量: ${JSON.stringify(hook.extractedVariables)}`));
     }
   }
 
@@ -274,6 +335,8 @@ export class ReportGenerator {
         name: suite.suiteName,
         durationMs: suite.duration,
         summary: suite.summary,
+        setup: suite.setupResult ? this.serializeHookResult(suite.setupResult) : undefined,
+        teardown: suite.teardownResult ? this.serializeHookResult(suite.teardownResult) : undefined,
         tests: suite.testResults.map(test => this.serializeTestResult(test))
       }))
     };
@@ -321,6 +384,27 @@ export class ReportGenerator {
     };
   }
 
+  private serializeHookResult(hook: HookExecutionResult): any {
+    return {
+      name: hook.name,
+      status: hook.status,
+      durationMs: hook.duration,
+      message: hook.message,
+      error: hook.error,
+      request: hook.request,
+      response: hook.response ? {
+        status: hook.response.status,
+        statusText: hook.response.statusText,
+        headers: hook.response.headers,
+        timeMs: hook.response.time,
+        bodyPreview: this.getBodyPreview(hook.response.body)
+      } : null,
+      extractedVariables: Object.keys(hook.extractedVariables).length > 0
+        ? hook.extractedVariables
+        : undefined
+    };
+  }
+
   private getBodyPreview(body: any, maxLength: number = 5000): any {
     if (body === null || body === undefined) return null;
     if (typeof body === 'string') {
@@ -364,21 +448,70 @@ export class ReportGenerator {
 
   private generateTestSuiteXml(suite: SuiteExecutionResult): string {
     let xml = '';
+    let totalTests = suite.summary.total;
+    let totalFailures = suite.summary.failed;
+    let totalSkipped = suite.summary.skipped;
+    let totalErrors = 0;
+
+    if (suite.setupResult && suite.setupResult.status === 'failed') {
+      totalErrors++;
+    }
+
     xml += '  <testsuite';
     xml += ` name="${this.escapeXml(suite.suiteName)}"`;
-    xml += ` tests="${suite.summary.total}"`;
-    xml += ` failures="${suite.summary.failed}"`;
-    xml += ` skipped="${suite.summary.skipped}"`;
-    xml += ` errors="0"`;
+    xml += ` tests="${totalTests}"`;
+    xml += ` failures="${totalFailures}"`;
+    xml += ` skipped="${totalSkipped}"`;
+    xml += ` errors="${totalErrors}"`;
     xml += ` time="${(suite.duration / 1000).toFixed(3)}"`;
     xml += ` timestamp="${new Date(suite.startTime).toISOString()}"`;
     xml += '>\n';
+
+    if (suite.setupResult) {
+      xml += this.generateHookXml(suite.setupResult);
+    }
 
     for (const test of suite.testResults) {
       xml += this.generateTestCaseXml(test);
     }
 
+    if (suite.teardownResult) {
+      xml += this.generateHookXml(suite.teardownResult);
+    }
+
     xml += '  </testsuite>\n';
+    return xml;
+  }
+
+  private generateHookXml(hook: HookExecutionResult): string {
+    let xml = '';
+    const hookLabel = hook.name === 'setup' ? '[Setup]' : '[Teardown]';
+    xml += '    <testcase';
+    xml += ` classname="${this.escapeXml(hookLabel)}"`;
+    xml += ` name="${this.escapeXml(hookLabel)}"`;
+    xml += ` time="${(hook.duration / 1000).toFixed(3)}"`;
+
+    if (hook.status === 'failed') {
+      xml += '>\n';
+      if (hook.name === 'teardown') {
+        xml += `      <skipped message="${this.escapeXml('Teardown 钩子警告: ' + (hook.message || hook.error || '执行失败'))}" />\n`;
+      } else {
+        xml += '      <error';
+        xml += ` message="${this.escapeXml(hook.message || hook.error || 'Setup 钩子执行失败')}"`;
+        xml += ` type="HookError"`;
+        xml += '>\n';
+        xml += `        <![CDATA[${this.escapeCdata(hook.error || hook.message || '')}]]>\n`;
+        xml += '      </error>\n';
+      }
+      xml += '    </testcase>\n';
+    } else if (hook.status === 'skipped') {
+      xml += '>\n';
+      xml += `      <skipped message="${this.escapeXml(hook.message || '跳过')}" />\n`;
+      xml += '    </testcase>\n';
+    } else {
+      xml += ' />\n';
+    }
+
     return xml;
   }
 
@@ -811,9 +944,19 @@ function switchTab(tabGroup, tabName) {
         ? `<span class="badge badge-skipped">${suite.summary.skipped} 跳过</span>`
         : `<span class="badge badge-passed">全部通过</span>`;
 
-      const testsHtml = suite.testResults.map((test, j) =>
+      let suiteBodyHtml = '';
+
+      if (suite.setupResult) {
+        suiteBodyHtml += this.buildHtmlHookItem(suite.setupResult, `${suiteId}-setup`);
+      }
+
+      suiteBodyHtml += suite.testResults.map((test, j) =>
         this.buildHtmlTestItem(test, suite, false, `${suiteId}-${j}`)
       ).join('');
+
+      if (suite.teardownResult) {
+        suiteBodyHtml += this.buildHtmlHookItem(suite.teardownResult, `${suiteId}-teardown`);
+      }
 
       html += `<div class="suite-card">
         <div class="suite-header" onclick="toggleSuite('${suiteId}')">
@@ -830,11 +973,85 @@ function switchTab(tabGroup, tabName) {
           </div>
         </div>
         <div class="suite-body" id="suite-body-${suiteId}">
-          ${testsHtml}
+          ${suiteBodyHtml}
         </div>
       </div>`;
     }
     return html;
+  }
+
+  private buildHtmlHookItem(
+    hook: HookExecutionResult,
+    id: string
+  ): string {
+    let icon = '✅', statusBadge = `<span class="badge badge-passed">通过</span>`;
+    if (hook.status === 'failed') {
+      icon = hook.name === 'teardown' ? '⚠️' : '❌';
+      statusBadge = hook.name === 'teardown'
+        ? `<span class="badge badge-skipped">警告</span>`
+        : `<span class="badge badge-failed">失败</span>`;
+    } else if (hook.status === 'skipped') {
+      icon = '⏭️';
+      statusBadge = `<span class="badge badge-skipped">跳过</span>`;
+    }
+
+    const hookLabel = hook.name === 'setup' ? '🔧 Setup 钩子' : '🧹 Teardown 钩子';
+
+    let bodyHtml = '';
+    if (hook.status === 'failed' && (hook.message || hook.error)) {
+      bodyHtml += `<div class="info-row"><span class="info-label">${hook.name === 'teardown' ? '警告' : '错误'}</span><span class="info-value" style="color:${hook.name === 'teardown' ? '#e6a23c' : '#f56c6c'}">${this.escapeHtml(hook.message || hook.error || '')}</span></div>`;
+    }
+
+    if (Object.keys(hook.extractedVariables).length > 0) {
+      bodyHtml += `<div class="info-row"><span class="info-label">提取变量</span><span class="info-value"><pre style="margin:0">${JSON.stringify(hook.extractedVariables, null, 2)}</pre></span></div>`;
+    }
+
+    if (hook.request && hook.response) {
+      const reqHeadersStr = hook.request.headers
+        ? JSON.stringify(hook.request.headers, null, 2)
+        : '(无)';
+      const reqBodyStr = hook.request.body !== undefined && hook.request.body !== null
+        ? (typeof hook.request.body === 'string' ? hook.request.body : JSON.stringify(hook.request.body, null, 2))
+        : '(无)';
+      const respStatusStr = `${hook.response.status} ${hook.response.statusText} | ${hook.response.time}ms`;
+      const respHeadersStr = JSON.stringify(hook.response.headers, null, 2);
+      const respBodyStr = typeof hook.response.body === 'string'
+        ? hook.response.body
+        : JSON.stringify(hook.response.body, null, 2);
+
+      bodyHtml += `<div class="tabs">
+        <div class="tab active" data-tab-group="hook-tabs-${id}" data-tab="req" onclick="switchTab('hook-tabs-${id}','req')">📤 请求</div>
+        <div class="tab" data-tab-group="hook-tabs-${id}" data-tab="resp" onclick="switchTab('hook-tabs-${id}','resp')">📥 响应</div>
+      </div>
+      <div class="tab-content active" data-tab-content-group="hook-tabs-${id}" data-tab-content="req">
+        <div class="info-row"><span class="info-label">方法</span><span class="info-value"><strong>${this.escapeHtml(hook.request.method)}</strong></span></div>
+        <div class="info-row"><span class="info-label">URL</span><span class="info-value">${this.escapeHtml(hook.request.url)}</span></div>
+        <div class="info-row"><span class="info-label">Headers</span><span class="info-value"><div class="details-block">${this.escapeHtml(reqHeadersStr)}</div></span></div>
+        <div class="info-row"><span class="info-label">Body</span><span class="info-value"><div class="details-block">${this.escapeHtml(reqBodyStr)}</div></span></div>
+      </div>
+      <div class="tab-content" data-tab-content-group="hook-tabs-${id}" data-tab-content="resp">
+        <div class="info-row"><span class="info-label">状态</span><span class="info-value"><strong>${this.escapeHtml(respStatusStr)}</strong></span></div>
+        <div class="info-row"><span class="info-label">Headers</span><span class="info-value"><div class="details-block">${this.escapeHtml(respHeadersStr)}</div></span></div>
+        <div class="info-row"><span class="info-label">Body</span><span class="info-value"><div class="details-block">${this.escapeHtml(respBodyStr)}</div></span></div>
+      </div>`;
+    }
+
+    return `<div class="test-item">
+      <div class="test-header" onclick="toggleTest('${id}')">
+        <div class="left">
+          <span class="test-icon">${icon}</span>
+          <span class="test-name">${hookLabel}</span>
+        </div>
+        <div class="test-meta">
+          ${statusBadge}
+          <span>${hook.duration}ms</span>
+          <span class="suite-toggle open" id="test-toggle-${id}">▶</span>
+        </div>
+      </div>
+      <div class="test-body collapsed" id="test-body-${id}">
+        ${bodyHtml}
+      </div>
+    </div>`;
   }
 
   private buildHtmlTestItem(

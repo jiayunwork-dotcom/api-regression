@@ -28,6 +28,7 @@ import {
   StatusUpdateMessage,
   ShardCompleteMessage,
   WorkerHeartbeatMessage,
+  StealRequestMessage,
   AssignShardMessage,
   SyncVariablesMessage,
   RetryTestMessage,
@@ -38,6 +39,9 @@ import {
   ErrorMessage,
   MergedReportResult,
   ShardExecutionState,
+  EventMessage,
+  TestCaseInShard,
+  TestCaseStatus,
 } from '../../types/distributed';
 import { ShardManager } from './shardManager';
 import { ReportMerger } from './reportMerger';
@@ -58,8 +62,10 @@ export class TestCoordinator {
   private config: CoordinatorConfig;
   private server: http.Server;
   private wss: WebSocket.Server;
+  private eventWss: WebSocket.Server;
   private shardManager: ShardManager;
   private workers: Map<string, WorkerConnection> = new Map();
+  private eventClients: Set<WebSocket> = new Set();
   private shards: TestShard[] = [];
   private availableVariables: Record<string, any> = {};
   private reportMerger!: ReportMerger;
@@ -103,6 +109,7 @@ export class TestCoordinator {
 
     this.server = http.createServer((req, res) => this.handleHttpRequest(req, res));
     this.wss = new WebSocket.Server({ noServer: true });
+    this.eventWss = new WebSocket.Server({ noServer: true });
 
     this.completionPromise = new Promise<RunSummary>((resolve, reject) => {
       this.resolveComplete = resolve;
@@ -155,6 +162,10 @@ export class TestCoordinator {
         this.wss.handleUpgrade(request, socket, head, ws => {
           this.handleWebSocketConnection(ws, request);
         });
+      } else if (pathname === '/events') {
+        this.eventWss.handleUpgrade(request, socket, head, ws => {
+          this.handleEventClientConnection(ws);
+        });
       } else {
         socket.destroy();
       }
@@ -162,6 +173,7 @@ export class TestCoordinator {
 
     this.server.listen(this.config.port, () => {
       console.log(chalk.green(`✅ Coordinator 服务已启动: ws://0.0.0.0:${this.config.port}/ws`));
+      console.log(chalk.green(`   事件推送: ws://0.0.0.0:${this.config.port}/events`));
       console.log(chalk.green(`   状态接口: http://0.0.0.0:${this.config.port}/status\n`));
     });
 
@@ -216,6 +228,42 @@ export class TestCoordinator {
     });
   }
 
+  private handleEventClientConnection(ws: WebSocket): void {
+    this.eventClients.add(ws);
+
+    const snapshot = this.createSnapshotEvent();
+    this.sendEventToClient(ws, snapshot);
+
+    ws.on('close', () => {
+      this.eventClients.delete(ws);
+    });
+
+    ws.on('error', () => {
+      this.eventClients.delete(ws);
+    });
+  }
+
+  private broadcastEvent(event: EventMessage): void {
+    for (const client of this.eventClients) {
+      this.sendEventToClient(client, event);
+    }
+  }
+
+  private sendEventToClient(ws: WebSocket, event: EventMessage): void {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(event));
+    }
+  }
+
+  private createSnapshotEvent(): EventMessage {
+    const status = this.getStatus();
+    return {
+      event: 'snapshot',
+      timestamp: Date.now(),
+      status,
+    };
+  }
+
   private handleWorkerMessage(
     tempId: string,
     message: WorkerMessage,
@@ -245,6 +293,9 @@ export class TestCoordinator {
         break;
       case 'worker_heartbeat':
         this.handleHeartbeat(worker.id, message as WorkerHeartbeatMessage);
+        break;
+      case 'steal_request':
+        this.handleStealRequest(worker.id, message as StealRequestMessage);
         break;
       case 'error':
         console.error(chalk.red(`❌ Worker ${worker.id} 错误: ${(message as ErrorMessage).message}`));
@@ -299,6 +350,12 @@ export class TestCoordinator {
       workerId: message.workerId,
     } as AuthSuccessMessage);
 
+    this.broadcastEvent({
+      event: 'worker_joined',
+      timestamp: Date.now(),
+      worker: { ...workerInfo },
+    });
+
     this.assignNextShard(message.workerId);
   }
 
@@ -311,11 +368,25 @@ export class TestCoordinator {
     worker.info.currentTestCaseId = update.testCaseId;
 
     const state = this.shardManager.getShardState(update.shardId);
+    const shard = this.shardManager.getShard(update.shardId);
     if (state) {
       state.lastStatusUpdate = Date.now();
       state.testCaseStatus.set(update.testCaseId, update.status);
 
-      if (update.status === 'passed' || update.status === 'failed' || update.status === 'skipped') {
+      const isCompleted = update.status === 'passed' || update.status === 'failed' || update.status === 'skipped' || update.status === 'error';
+      if (isCompleted) {
+        const testCase = shard?.testCases.find(tc => tc.id === update.testCaseId);
+        this.broadcastEvent({
+          event: 'test_completed',
+          timestamp: Date.now(),
+          shardId: update.shardId,
+          testCaseId: update.testCaseId,
+          testCaseName: testCase?.name || update.testCaseId,
+          status: update.status,
+          duration: update.duration,
+          workerId,
+        });
+
         const existingResult = state.results.get(update.testCaseId);
         if (existingResult && existingResult.retryAttempts) {
           const markedResult = {
@@ -490,7 +561,14 @@ export class TestCoordinator {
     const worker = this.workers.get(tempId);
     if (!worker) return;
 
+    const workerId = worker.id;
     console.log(chalk.yellow(`⚠️  Worker ${worker.id} 断开连接`));
+
+    this.broadcastEvent({
+      event: 'worker_left',
+      timestamp: Date.now(),
+      workerId,
+    });
 
     worker.info.status = 'disconnected';
 
@@ -550,6 +628,25 @@ export class TestCoordinator {
 
     this.workers.delete(tempId);
     this.checkCompletion();
+  }
+
+  private handleStealRequest(workerId: string, message: StealRequestMessage): void {
+    const worker = this.getWorkerById(workerId);
+    if (!worker || worker.info.status === 'unhealthy') {
+      return;
+    }
+
+    if (worker.info.status !== 'idle') {
+      return;
+    }
+
+    this.assignNextShard(workerId);
+
+    if (worker.info.status === 'idle') {
+      this.sendMessage(worker.ws, {
+        type: 'no_more_shards',
+      } as NoMoreShardsMessage);
+    }
   }
 
   private assignNextShard(workerId: string): void {
@@ -629,9 +726,18 @@ export class TestCoordinator {
         variables: this.environment?.variables,
         headers: this.environment?.headers,
       },
+      variableTimeout: this.config.variableTimeout,
     };
 
     console.log(chalk.cyan(`📤 分配分片 ${shard.id} 给 Worker ${worker.id} (${shard.testCases.length} 个用例)`));
+
+    this.broadcastEvent({
+      event: 'shard_assigned',
+      timestamp: Date.now(),
+      shardId: shard.id,
+      workerId: worker.id,
+      testCaseCount: shard.testCases.length,
+    });
 
     this.sendMessage(worker.ws, {
       type: 'assign_shard',
@@ -693,6 +799,7 @@ export class TestCoordinator {
         variables: this.environment?.variables,
         headers: this.environment?.headers,
       },
+      variableTimeout: this.config.variableTimeout,
     };
 
     const retry: RetryAssignment = {
@@ -871,6 +978,22 @@ export class TestCoordinator {
     console.log(chalk.cyan('  📊 分布式测试执行完成'));
     console.log(chalk.cyan('═'.repeat(70) + '\n'));
 
+    const status = this.getStatus();
+    this.broadcastEvent({
+      event: 'all_done',
+      timestamp: Date.now(),
+      summary: {
+        totalTestCases: status.totalTestCases,
+        passedTestCases: status.passedTestCases,
+        failedTestCases: status.failedTestCases,
+        skippedTestCases: status.skippedTestCases,
+        errorTestCases: status.errorTestCases,
+        totalShards: this.shards.length,
+        completedShards: status.completedShards,
+        totalDuration: mergedResult.runSummary.duration,
+      },
+    });
+
     this.generateReports(mergedResult);
 
     for (const [, worker] of this.workers) {
@@ -944,6 +1067,17 @@ export class TestCoordinator {
         return status === 'passed' || status === 'failed' || status === 'skipped';
       }).length;
 
+      const testCases: TestCaseInShard[] = shard.testCases.map(tc => {
+        const status = (state?.testCaseStatus.get(tc.id) || 'pending') as TestCaseStatus;
+        const result = state?.results.get(tc.id);
+        return {
+          id: tc.id,
+          name: tc.name,
+          status,
+          duration: result?.duration,
+        };
+      });
+
       return {
         id: shard.id,
         suiteId: shard.suiteId,
@@ -951,7 +1085,8 @@ export class TestCoordinator {
         workerId: state?.workerId,
         testCaseCount: shard.testCases.length,
         completedCount,
-      } as const;
+        testCases,
+      };
     });
 
     let completedTestCases = 0;
@@ -1021,5 +1156,9 @@ export class TestCoordinator {
     for (const [, worker] of this.workers) {
       worker.ws.close();
     }
+    for (const client of this.eventClients) {
+      client.close();
+    }
+    this.eventClients.clear();
   }
 }

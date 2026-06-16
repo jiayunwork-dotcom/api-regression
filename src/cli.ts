@@ -115,6 +115,7 @@ async function main() {
     .requiredOption('-p, --port <number>', 'WebSocket服务端口', parseInt)
     .requiredOption('-s, --suites <paths...>', '测试套件文件或目录路径')
     .option('--shard-timeout <seconds>', '分片执行超时时间（秒）', parseInt, 300)
+    .option('--variable-timeout <seconds>', '变量等待超时时间（秒）', parseInt, 30)
     .option('--max-retries <number>', '失败用例最大重试次数', parseInt, 0)
     .option('--secret <secret>', '认证共享密钥')
     .option('-o, --output-dir <path>', '报告输出目录', './reports')
@@ -151,6 +152,7 @@ async function main() {
     .requiredOption('--coordinator <url>', 'Coordinator WebSocket地址，如 ws://localhost:9800')
     .requiredOption('--id <workerId>', 'Worker唯一标识')
     .option('--secret <secret>', '认证共享密钥')
+    .option('--variable-timeout <seconds>', '变量等待超时时间（秒）', parseInt, 30)
     .option('-n, --concurrency <number>', '并发执行的用例数量', parseInt, 5)
     .option('--env-file <path>', '环境配置文件路径 (YAML)')
     .option('-b, --base-url <url>', '覆盖配置的基础URL')
@@ -369,6 +371,7 @@ async function executeCoordinator(cmdOptions: any): Promise<void> {
     port: cmdOptions.port,
     suitePaths,
     shardTimeout: (cmdOptions.shardTimeout || 300) * 1000,
+    variableTimeout: (cmdOptions.variableTimeout || 30) * 1000,
     maxRetries: cmdOptions.maxRetries || 0,
     secret,
     outputDir: cmdOptions.outputDir || './reports',
@@ -430,6 +433,7 @@ async function executeWorker(cmdOptions: any): Promise<void> {
     environmentFile: cmdOptions.envFile,
     baseUrl: cmdOptions.baseUrl,
     variables: Object.keys(runtimeVars).length > 0 ? runtimeVars : undefined,
+    variableTimeout: (cmdOptions.variableTimeout || 30) * 1000,
   };
 
   const worker = new TestWorker(config);

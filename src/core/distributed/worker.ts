@@ -30,6 +30,7 @@ import {
   ExecutionCompleteMessage,
   ErrorMessage,
   TestCaseStatus,
+  StealRequestMessage,
 } from '../../types/distributed';
 import { TestRunner } from '../runner';
 import { VariableResolver } from '../variables';
@@ -41,6 +42,9 @@ import { ConfigParser } from '../parser';
 const HEARTBEAT_INTERVAL = 10000;
 const RECONNECT_INTERVAL = 5000;
 const MAX_RECONNECT_ATTEMPTS = 5;
+const STEAL_INTERVAL = 5000;
+const DEFAULT_VARIABLE_TIMEOUT = 30000;
+const VAR_REF_PATTERN = /\$\{([^}]+)\}/g;
 
 export class TestWorker {
   private config: WorkerConfig;
@@ -51,11 +55,13 @@ export class TestWorker {
   private variableResolver: VariableResolver = new VariableResolver();
   private isRunning: boolean = false;
   private heartbeatTimer?: NodeJS.Timeout;
+  private stealTimer?: NodeJS.Timeout;
   private reconnectAttempts: number = 0;
   private resolveComplete!: (value: RunSummary | null) => void;
   private rejectComplete!: (reason: any) => void;
   private completionPromise: Promise<RunSummary | null>;
   private currentVariables: Record<string, any> = {};
+  private variableResolveCallbacks: Map<string, Array<() => void>> = new Map();
 
   constructor(config: WorkerConfig) {
     this.config = config;
@@ -164,6 +170,7 @@ export class TestWorker {
     const assignment = message.assignment;
     console.log(chalk.cyan(`📥 收到分片分配: ${assignment.shardId} (${assignment.testCases.length} 个用例)`));
 
+    this.stopStealTimer();
     this.currentShard = assignment;
     this.currentVariables = { ...assignment.variables };
 
@@ -185,6 +192,14 @@ export class TestWorker {
     for (const [key, value] of Object.entries(sync.variables)) {
       this.currentVariables[key] = value;
       this.variableResolver.addExtractedVar(key, value);
+
+      const callbacks = this.variableResolveCallbacks.get(key);
+      if (callbacks) {
+        for (const cb of callbacks) {
+          try { cb(); } catch { /* ignore */ }
+        }
+        this.variableResolveCallbacks.delete(key);
+      }
     }
   }
 
@@ -196,6 +211,7 @@ export class TestWorker {
       `🔄 收到重试任务: ${retry.testCaseId} (尝试 ${retry.retryAttempt})`
     ));
 
+    this.stopStealTimer();
     this.currentShard = assignment;
     this.currentVariables = { ...assignment.variables };
 
@@ -212,11 +228,34 @@ export class TestWorker {
   private handleNoMoreShards(): void {
     console.log(chalk.cyan('📭 没有更多分片，等待执行完成'));
     this.stopHeartbeat();
+    this.startStealTimer();
+  }
+
+  private startStealTimer(): void {
+    if (this.stealTimer) return;
+
+    this.stealTimer = setInterval(() => {
+      if (this.ws.readyState === WebSocket.OPEN && this.authenticated && !this.isRunning) {
+        const stealMsg: StealRequestMessage = {
+          type: 'steal_request',
+          workerId: this.workerId,
+        };
+        this.send(stealMsg);
+      }
+    }, STEAL_INTERVAL);
+  }
+
+  private stopStealTimer(): void {
+    if (this.stealTimer) {
+      clearInterval(this.stealTimer);
+      this.stealTimer = undefined;
+    }
   }
 
   private handleExecutionComplete(message: ExecutionCompleteMessage): void {
     console.log(chalk.green('\n🎉 执行完成'));
     this.stopHeartbeat();
+    this.stopStealTimer();
     this.ws.close();
     this.resolveComplete(message.summary);
   }
@@ -278,11 +317,28 @@ export class TestWorker {
 
       const sortedTestCases = this.sortTestCases(assignment.testCases, assignment.suite);
 
+      const variableTimeout = (assignment.variableTimeout ?? this.config.variableTimeout ?? DEFAULT_VARIABLE_TIMEOUT);
+
       for (const testCase of sortedTestCases) {
         if (testCase.skip) {
           const skipResult = this.createSkippedResult(testCase, assignment.suite, '用例标记为跳过');
           results.push(skipResult);
           this.sendStatusUpdate(assignment.shardId, testCase.id, 'skipped');
+          continue;
+        }
+
+        const requiredVars = this.extractRequiredVariables(testCase);
+        const varsReady = await this.waitForVariables(requiredVars, variableTimeout);
+
+        if (!varsReady) {
+          const missingVars = requiredVars.filter(v => !(v in this.currentVariables));
+          const skipResult = this.createSkippedResult(
+            testCase,
+            assignment.suite,
+            `variable_timeout: 等待变量 [${missingVars.join(', ')}] 超时`
+          );
+          results.push(skipResult);
+          this.sendStatusUpdate(assignment.shardId, testCase.id, 'skipped', undefined, undefined, undefined, undefined, undefined, 'variable_timeout');
           continue;
         }
 
@@ -310,6 +366,14 @@ export class TestWorker {
               resolver.addExtractedVar(key, value);
               this.variableResolver.addExtractedVar(key, value);
               this.currentVariables[key] = value;
+
+              const callbacks = this.variableResolveCallbacks.get(key);
+              if (callbacks) {
+                for (const cb of callbacks) {
+                  try { cb(); } catch { /* ignore */ }
+                }
+                this.variableResolveCallbacks.delete(key);
+              }
             }
           }
 
@@ -487,6 +551,84 @@ export class TestWorker {
     return result;
   }
 
+  private extractRequiredVariables(testCase: TestCase): string[] {
+    const required = new Set<string>();
+
+    const walkObject = (obj: any): void => {
+      if (obj === null || obj === undefined) return;
+      if (typeof obj === 'string') {
+        const matches = obj.match(VAR_REF_PATTERN);
+        if (matches) {
+          for (const match of matches) {
+            const varName = match.slice(2, -1).trim();
+            const cleanName = varName.includes(':')
+              ? varName.split(':').slice(1).join(':')
+              : varName;
+            if (!varName.startsWith('process.env.') &&
+                !varName.startsWith('env:') &&
+                !varName.startsWith('global:') &&
+                !varName.startsWith('suite:')) {
+              required.add(cleanName);
+            }
+          }
+        }
+      } else if (Array.isArray(obj)) {
+        obj.forEach(walkObject);
+      } else if (typeof obj === 'object') {
+        Object.values(obj).forEach(walkObject);
+      }
+    };
+
+    walkObject(testCase.request);
+    walkObject(testCase.assertions);
+    walkObject(testCase.extracts);
+
+    return Array.from(required);
+  }
+
+  private waitForVariables(varNames: string[], timeoutMs: number): Promise<boolean> {
+    const missingVars = varNames.filter(v => !(v in this.currentVariables));
+    if (missingVars.length === 0) {
+      return Promise.resolve(true);
+    }
+
+    return new Promise<boolean>((resolve) => {
+      let resolved = false;
+      let pendingCount = missingVars.length;
+
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          for (const v of missingVars) {
+            const callbacks = this.variableResolveCallbacks.get(v);
+            if (callbacks) {
+              const idx = callbacks.indexOf(onVarResolved);
+              if (idx > -1) callbacks.splice(idx, 1);
+            }
+          }
+          resolve(false);
+        }
+      }, timeoutMs);
+
+      const onVarResolved = () => {
+        if (resolved) return;
+        pendingCount--;
+        if (pendingCount <= 0) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve(true);
+        }
+      };
+
+      for (const v of missingVars) {
+        if (!this.variableResolveCallbacks.has(v)) {
+          this.variableResolveCallbacks.set(v, []);
+        }
+        this.variableResolveCallbacks.get(v)!.push(onVarResolved);
+      }
+    });
+  }
+
   private createSkippedResult(
     testCase: TestCase,
     suite: TestSuite,
@@ -607,6 +749,7 @@ export class TestWorker {
 
   stop(): void {
     this.stopHeartbeat();
+    this.stopStealTimer();
     this.ws.close();
   }
 }

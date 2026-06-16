@@ -39,6 +39,7 @@ export interface ShardAssignment {
     variables?: Record<string, any>;
     headers?: Record<string, string>;
   };
+  variableTimeout?: number;
 }
 
 export interface StatusUpdate {
@@ -95,6 +96,13 @@ export interface WorkerInfo {
   ip?: string;
 }
 
+export interface TestCaseInShard {
+  id: string;
+  name: string;
+  status: TestCaseStatus;
+  duration?: number;
+}
+
 export interface CoordinatorStatus {
   startTime: number;
   totalTestCases: number;
@@ -113,6 +121,7 @@ export interface CoordinatorStatus {
     workerId?: string;
     testCaseCount: number;
     completedCount: number;
+    testCases: TestCaseInShard[];
   }>;
 }
 
@@ -133,6 +142,7 @@ export interface CoordinatorConfig {
   tags?: string[];
   excludeTags?: string[];
   targetShardCount?: number;
+  variableTimeout?: number;
 }
 
 export interface WorkerConfig {
@@ -143,6 +153,7 @@ export interface WorkerConfig {
   environmentFile?: string;
   baseUrl?: string;
   variables?: Record<string, any>;
+  variableTimeout?: number;
 }
 
 export type MessageType =
@@ -157,7 +168,16 @@ export type MessageType =
   | 'worker_heartbeat'
   | 'no_more_shards'
   | 'execution_complete'
+  | 'steal_request'
   | 'error';
+
+export type EventType =
+  | 'snapshot'
+  | 'worker_joined'
+  | 'worker_left'
+  | 'shard_assigned'
+  | 'test_completed'
+  | 'all_done';
 
 export interface BaseMessage {
   type: MessageType;
@@ -212,6 +232,11 @@ export interface WorkerHeartbeatMessage extends BaseMessage {
   currentTestCaseId?: string;
 }
 
+export interface StealRequestMessage extends BaseMessage {
+  type: 'steal_request';
+  workerId: string;
+}
+
 export interface NoMoreShardsMessage extends BaseMessage {
   type: 'no_more_shards';
 }
@@ -242,7 +267,67 @@ export type WorkerMessage =
   | StatusUpdateMessage
   | ShardCompleteMessage
   | WorkerHeartbeatMessage
+  | StealRequestMessage
   | ErrorMessage;
+
+export interface EventBase {
+  event: EventType;
+  timestamp: number;
+}
+
+export interface WorkerJoinedEvent extends EventBase {
+  event: 'worker_joined';
+  worker: WorkerInfo;
+}
+
+export interface WorkerLeftEvent extends EventBase {
+  event: 'worker_left';
+  workerId: string;
+}
+
+export interface ShardAssignedEvent extends EventBase {
+  event: 'shard_assigned';
+  shardId: string;
+  workerId: string;
+  testCaseCount: number;
+}
+
+export interface TestCompletedEvent extends EventBase {
+  event: 'test_completed';
+  shardId: string;
+  testCaseId: string;
+  testCaseName: string;
+  status: TestCaseStatus;
+  duration?: number;
+  workerId: string;
+}
+
+export interface AllDoneEvent extends EventBase {
+  event: 'all_done';
+  summary: {
+    totalTestCases: number;
+    passedTestCases: number;
+    failedTestCases: number;
+    skippedTestCases: number;
+    errorTestCases: number;
+    totalShards: number;
+    completedShards: number;
+    totalDuration: number;
+  };
+}
+
+export interface SnapshotEvent extends EventBase {
+  event: 'snapshot';
+  status: CoordinatorStatus;
+}
+
+export type EventMessage =
+  | SnapshotEvent
+  | WorkerJoinedEvent
+  | WorkerLeftEvent
+  | ShardAssignedEvent
+  | TestCompletedEvent
+  | AllDoneEvent;
 
 export interface ShardExecutionState {
   shardId: string;

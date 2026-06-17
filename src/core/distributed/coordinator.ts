@@ -640,6 +640,22 @@ export class TestCoordinator {
       return;
     }
 
+    const hasRetry = this.retryQueue.length > 0;
+
+    const readyShards = this.shardManager.getReadyShards();
+    const availableShards = readyShards.filter(s => {
+      const state = this.shardManager.getShardState(s.id);
+      return state && state.status === 'pending' && !state.workerId;
+    });
+    const hasAvailableShard = availableShards.length > 0;
+
+    if (!hasRetry && !hasAvailableShard) {
+      this.sendMessage(worker.ws, {
+        type: 'no_more_shards',
+      } as NoMoreShardsMessage);
+      return;
+    }
+
     this.assignNextShard(workerId);
 
     if (worker.info.status === 'idle') {

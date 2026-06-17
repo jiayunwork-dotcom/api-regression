@@ -447,6 +447,8 @@ export class TestWorker {
       console.log(chalk.green(
         `✅ 分片 ${assignment.shardId} 执行完成，成功: ${success}`
       ));
+
+      this.startStealTimer();
     }
   }
 
